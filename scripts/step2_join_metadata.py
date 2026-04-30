@@ -1,31 +1,26 @@
 """
-Step 2: dicom_info.csv ve meta.csv ile JOIN, 'cropped images' satirlarini temizle.
+Step 2: Join with dicom_info.csv and meta.csv to resolve absolute paths for cropped images and ROI masks.
 
-Mass CSV path formati:
-  Mass-Training_P_00001_LEFT_CC/<StudyUID>/<SeriesUID>/<file>.dcm
-Yani path'in ikinci UID'si SeriesInstanceUID. dicom_info ile bu anahtarla JOIN
-yapacagiz. Ayni SeriesUID icin dicom_info'da birden fazla kayit olabilir
-(maske klasorunde birden fazla jpeg). Step 5'te piksel analizi ile gercek
-maske secilecek.
+Mass CSV paths format:
+  Mass-Training_P_00001_LEFT_CC_1/<StudyUID>/<SeriesUID>/<file>.dcm
+The second UID is the SeriesInstanceUID, used to join with dicom_info.
 """
 import pandas as pd
 from config import DICOM_INFO_CSV, META_CSV, OUTPUT_DIR, JPEG_DIR
 
 
 def extract_series_uid(path: str) -> str | None:
-    """Mass CSV path'inden SeriesInstanceUID (ikinci segment) cikarir."""
-    if not isinstance(path, str):
+    """Extract SeriesInstanceUID from Mass CSV path."""
+    if pd.isna(path) or not isinstance(path, str):
         return None
     parts = path.split("/")
-    # Mass-Training_P_xxx_YYY_ZZZ/<StudyUID>/<SeriesUID>/<file>.dcm
     if len(parts) >= 3:
         return parts[2]
     return None
 
 
 def normalize_dicom_info(di: pd.DataFrame) -> pd.DataFrame:
-    """dicom_info kolonlarini snake_case'e cevir (mass_df ile ayni stil)."""
-    # Sadece ihtiyacimiz olan kolonlari tut
+    """Normalize dicom_info columns to snake_case."""
     keep = ["SeriesInstanceUID", "SeriesDescription", "image_path",
             "file_path", "PatientID", "Laterality", "PatientOrientation",
             "Rows", "Columns"]
@@ -45,77 +40,60 @@ def normalize_dicom_info(di: pd.DataFrame) -> pd.DataFrame:
 
 
 def main():
-    # --- 1. Mass df yukle (step 1 ciktisi) ---
+    # --- 1. Load mass df (step 1 output) ---
     mass = pd.read_csv(OUTPUT_DIR / "step1_mass_merged.csv")
-    print(f"[mass] baslangic satir sayisi: {len(mass)}")
+    print(f"[mass] starting row count: {len(mass)}")
 
-    # --- 2. dicom_info yukle + normalize + 'cropped images' temizle ---
+    # --- 2. Load dicom_info and normalize ---
     di = pd.read_csv(DICOM_INFO_CSV)
     print(f"[dicom_info] raw shape: {di.shape}")
-    print(f"[dicom_info] SeriesDescription dagilimi:")
-    print(di["SeriesDescription"].value_counts(dropna=False))
-
     di = normalize_dicom_info(di)
-
-    before = len(di)
-    di = di[di["series_description"] != "cropped images"].copy()
-    print(f"\n[filter] 'cropped images' atildi: {before} -> {len(di)} "
-          f"({before - len(di)} satir silindi)")
-
-    # NaN series_description'lari da at (ne oldugu belirsiz)
-    before = len(di)
+    
+    # Drop rows with NaN series_description
     di = di.dropna(subset=["series_description"])
-    print(f"[filter] NaN series_description atildi: {before} -> {len(di)}")
 
-    print(f"[dicom_info] kalan SeriesDescription dagilimi:")
-    print(di["series_description"].value_counts())
-
-    # --- 3. Mass path'lerden SeriesInstanceUID cikar ---
-    mass["full_series_uid"] = mass["image_file_path"].apply(extract_series_uid)
+    # --- 3. Extract SeriesInstanceUID from Mass paths ---
+    mass["cropped_series_uid"] = mass["cropped_image_file_path"].apply(extract_series_uid)
     mass["roi_series_uid"] = mass["roi_mask_file_path"].apply(extract_series_uid)
 
-    # --- 4. Full mammogram JOIN ---
-    full_df = di[di["series_description"] == "full mammogram images"][
+    # --- 4. Join Cropped Images ---
+    crop_df = di[di["series_description"] == "cropped images"][
         ["series_instance_uid", "jpeg_path", "dicom_rows", "dicom_columns"]
     ].rename(columns={
-        "series_instance_uid": "full_series_uid",
-        "jpeg_path": "full_jpeg_path",
-        "dicom_rows": "full_rows",
-        "dicom_columns": "full_cols",
+        "series_instance_uid": "cropped_series_uid",
+        "jpeg_path": "cropped_jpeg_path",
+        "dicom_rows": "crop_rows",
+        "dicom_columns": "crop_cols",
     })
-    # Full mammogram series'te tek jpeg bekleniyor; duplicate varsa ilkini al
-    dup = full_df["full_series_uid"].duplicated().sum()
-    if dup:
-        print(f"[warn] full mammogram series'te {dup} duplicate, ilki tutuldu.")
-        full_df = full_df.drop_duplicates(subset="full_series_uid", keep="first")
+    
+    # For a given crop series, we expect one image. If multiple, keep first.
+    dup = crop_df["cropped_series_uid"].duplicated().sum()
+    if dup > 0:
+        print(f"[warn] {dup} duplicates in cropped image series, keeping first.")
+        crop_df = crop_df.drop_duplicates(subset="cropped_series_uid", keep="first")
 
-    mass = mass.merge(full_df, on="full_series_uid", how="left")
+    mass = mass.merge(crop_df, on="cropped_series_uid", how="left")
+    missing_crop = mass["cropped_jpeg_path"].isna().sum()
+    print(f"[join:crop] missing cropped image match: {missing_crop} / {len(mass)}")
 
-    missing_full = mass["full_jpeg_path"].isna().sum()
-    print(f"\n[join:full] eslesemeyen full mammogram: {missing_full} / {len(mass)}")
-
-    # --- 5. ROI mask JOIN (birden fazla aday olabilir -> listele) ---
+    # --- 5. Join ROI masks (could be multiple candidates) ---
     roi_df = di[di["series_description"] == "ROI mask images"][
         ["series_instance_uid", "jpeg_path"]
     ].rename(columns={
         "series_instance_uid": "roi_series_uid",
         "jpeg_path": "roi_jpeg_path",
     })
-    # Her series_uid icin tum maske jpeg'lerini listele (Step 5 icin adaylar)
+    
     roi_agg = (roi_df.groupby("roi_series_uid")["roi_jpeg_path"]
                .apply(list).reset_index()
                .rename(columns={"roi_jpeg_path": "roi_mask_candidates"}))
     roi_agg["n_mask_candidates"] = roi_agg["roi_mask_candidates"].apply(len)
 
     mass = mass.merge(roi_agg, on="roi_series_uid", how="left")
-
     missing_roi = mass["roi_mask_candidates"].isna().sum()
-    print(f"[join:roi] eslesemeyen ROI mask: {missing_roi} / {len(mass)}")
+    print(f"[join:roi] missing ROI mask match: {missing_roi} / {len(mass)}")
 
-    # --- 6. Mutlak jpeg path'lere cevir ---
-    # dicom_info'daki jpeg_path formati: 'CBIS-DDSM/jpeg/<uid>/x.jpg'
-    # Bizdeki yerel yerlesim: <JPEG_DIR>/<uid>/x.jpg
-    # Bu yuzden 'CBIS-DDSM/jpeg/' onekini soyup JPEG_DIR ile birlestirecegiz.
+    # --- 6. Convert to absolute paths ---
     PREFIX = "CBIS-DDSM/jpeg/"
 
     def to_abs(rel):
@@ -124,7 +102,7 @@ def main():
         rel = rel[len(PREFIX):] if rel.startswith(PREFIX) else rel
         return str(JPEG_DIR / rel)
 
-    mass["full_image_abs_path"] = mass["full_jpeg_path"].apply(to_abs)
+    mass["cropped_image_abs_path"] = mass["cropped_jpeg_path"].apply(to_abs)
 
     def to_abs_list(lst):
         if not isinstance(lst, list):
@@ -133,7 +111,10 @@ def main():
 
     mass["roi_mask_abs_paths"] = mass["roi_mask_candidates"].apply(to_abs_list)
 
-    # --- 7. meta.csv JOIN (sadece referans bilgi - Collection vs.) ---
+    # --- 7. Join meta.csv (optional info) ---
+    # We can join on either the original full series or the crop series. 
+    # The full_image_file_path is named image_file_path in mass CSV.
+    mass["full_series_uid"] = mass["image_file_path"].apply(extract_series_uid)
     me = pd.read_csv(META_CSV)
     me = me[["SeriesInstanceUID", "Collection"]].rename(
         columns={"SeriesInstanceUID": "full_series_uid",
@@ -141,24 +122,22 @@ def main():
     ).drop_duplicates(subset="full_series_uid")
     mass = mass.merge(me, on="full_series_uid", how="left")
 
-    # --- 8. Ozet & kaydet ---
-    print("\n=== Ozet ===")
-    print(f"  toplam satir: {len(mass)}")
-    print(f"  full mammogram eslesen: {mass['full_jpeg_path'].notna().sum()}")
-    print(f"  ROI mask eslesen       : {mass['roi_mask_candidates'].notna().sum()}")
-    print(f"  n_mask_candidates dagilimi:")
-    print(mass["n_mask_candidates"].value_counts(dropna=False).sort_index())
-
-    # Eksik eslesmeleri logla
-    miss = mass[mass["full_jpeg_path"].isna() | mass["roi_mask_candidates"].isna()]
+    # --- 8. Summary & Save ---
+    print("\n=== Summary ===")
+    print(f"  total rows: {len(mass)}")
+    print(f"  cropped matched: {mass['cropped_jpeg_path'].notna().sum()}")
+    print(f"  ROI matched    : {mass['roi_mask_candidates'].notna().sum()}")
+    
+    # Log missing joins
+    miss = mass[mass["cropped_jpeg_path"].isna() | mass["roi_mask_candidates"].isna()]
     if len(miss) > 0:
         miss_out = OUTPUT_DIR / "step2_missing_joins.csv"
         miss[["patient_id", "left_or_right_breast", "image_view",
-              "abnormality_id", "full_series_uid", "roi_series_uid"]].to_csv(
+              "abnormality_id", "cropped_series_uid", "roi_series_uid"]].to_csv(
             miss_out, index=False)
-        print(f"  eksik JOIN'ler: {len(miss)} -> {miss_out}")
+        print(f"  missing joins logged: {len(miss)} -> {miss_out}")
 
-    # Listeleri CSV'ye kaydetmek icin string'e cevir (pipe ile ayirt)
+    # Format lists as pipe-separated strings for CSV
     mass_save = mass.copy()
     mass_save["roi_mask_abs_paths"] = mass_save["roi_mask_abs_paths"].apply(
         lambda x: "|".join(x) if isinstance(x, list) else ""
@@ -169,8 +148,7 @@ def main():
 
     out = OUTPUT_DIR / "step2_mass_joined.csv"
     mass_save.to_csv(out, index=False)
-    print(f"\n[ok] Kaydedildi: {out}")
-
+    print(f"\n[ok] Saved: {out}")
 
 if __name__ == "__main__":
     main()

@@ -1,15 +1,12 @@
 """
-Step 5: Maske dogrulama (piksel deger analizi).
+Step 5: Mask validation (pixel value analysis).
 
-CBIS-DDSM jpeg maskeleri bazen yanlis etiketlenmis olabilir (SeriesDescription
-"ROI mask images" olsa da icerigi aslinda cropped gorsel olabilir). JPEG
-kayipli oldugundan tam 0/255 beklenemez; bunun yerine bimodal dagilim testi:
-piksellerin %98'inden fazlasi [0..BIN_LOW] veya [BIN_HIGH..255] araliginda
-olmali.
+CBIS-DDSM jpeg masks can sometimes be mislabeled or corrupted. Because JPEG is lossy,
+we cannot expect exact 0/255 values; instead we use a bimodal distribution test:
+more than 98% of pixels must be in [0..BIN_LOW] or [BIN_HIGH..255] ranges.
 
-Ayrica 'bos' maskeler (toplam foreground pikseli cok az) tespit edilir.
-Step 6'da ayni (patient, breast, view) icin OR ile birlestirme yapilmadan
-once bos olanlarin atilmasi daha temiz sonuc verir.
+We also detect empty masks (very low foreground pixels).
+This ensures we only pass valid binary masks to Step 6 for crop-level mask resolution.
 """
 import numpy as np
 import pandas as pd

@@ -1,14 +1,14 @@
 """
-Step 8: Full-image Otsu background removal + CLAHE + resize.
+Step 8: Square pad and resize cropped images.
 
 Her geçerli görüntü için:
-  1. Otsu threshold → meme bölgesi tespiti (background sıfırlama)
-  2. CLAHE kontrast artırımı (sadece meme bölgesine)
-  3. Square pad (aspect ratio korunur) + 256×256 resize
-  4. ROI maske aynı transform ile işlenir (INTER_NEAREST)
+  1. Görüntüyü ve maskeyi yükle.
+  2. Square pad (aspect ratio korunarak, dar kenara siyah padding).
+  3. 256x256 resize.
+  4. Maskeyi kesin binarize et.
 
-Full mammogram korunur — tight crop YOK.
-Model "tüm mamogramda kitleyi bul ve segment et" görevini öğrenir.
+Full mammogram kullanılmadığı için CLAHE veya Otsu background removal 
+gibi karmaşık işlemlere gerek yoktur. Sadece resize yapılıp kaydedilir.
 
 Girdi : outputs/step7_validated.csv
 Çıktı : outputs/step8_processed.csv
@@ -24,53 +24,9 @@ from tqdm import tqdm
 from config import OUTPUT_DIR, LOG_DIR, IMAGE_SIZE, fix_path
 
 
-# --- CLAHE Parametreleri ---
-CLAHE_CLIP = 2.0
-CLAHE_GRID = (8, 8)
-
-# --- Otsu Parametreleri (step7 ile aynı) ---
-BORDER_CLEAR = 30
-OPEN_KSIZE = 15
-
-# Çıktı klasörleri
 PROCESSED_DIR = OUTPUT_DIR / "processed"
 IMG_OUT_DIR = PROCESSED_DIR / "images"
 MASK_OUT_DIR = PROCESSED_DIR / "masks"
-
-
-def get_breast_mask(gray: np.ndarray) -> np.ndarray:
-    """Otsu + kenar temizliği + largest CC -> binary meme maskesi."""
-    if gray.dtype != np.uint8:
-        gray = gray.astype(np.uint8)
-
-    proc = cv2.medianBlur(gray, 5)
-    _, binar = cv2.threshold(proc, 0, 255,
-                             cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    if BORDER_CLEAR > 0:
-        binar[:BORDER_CLEAR, :] = 0
-        binar[-BORDER_CLEAR:, :] = 0
-        binar[:, :BORDER_CLEAR] = 0
-        binar[:, -BORDER_CLEAR:] = 0
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                       (OPEN_KSIZE, OPEN_KSIZE))
-    binar = cv2.morphologyEx(binar, cv2.MORPH_OPEN, kernel)
-
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(binar, connectivity=8)
-    if num <= 1:
-        return np.ones_like(gray, dtype=np.uint8) * 255
-
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    largest_idx = 1 + int(np.argmax(areas))
-    return ((labels == largest_idx).astype(np.uint8)) * 255
-
-
-def apply_clahe(gray: np.ndarray, breast_mask: np.ndarray) -> np.ndarray:
-    """CLAHE'yi sadece meme bölgesine uygula, arkaplan siyah kalır."""
-    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_GRID)
-    enhanced = clahe.apply(gray)
-    return np.where(breast_mask > 0, enhanced, 0).astype(np.uint8)
 
 
 def pad_to_square(arr: np.ndarray, pad_value: int = 0) -> np.ndarray:
@@ -87,35 +43,19 @@ def pad_to_square(arr: np.ndarray, pad_value: int = 0) -> np.ndarray:
                               cv2.BORDER_CONSTANT, value=pad_value)
 
 
-def process_single(img_path: str, mask_path: str,
-                   size: int = IMAGE_SIZE) -> tuple:
-    """Tek bir görüntü-maske çifti: Otsu + CLAHE + pad + resize."""
-    # Görüntü yükle
+def process_single(img_path: str, mask_path: str, size: int = IMAGE_SIZE) -> tuple:
+    """Tek bir görüntü-maske çifti: pad + resize."""
     with Image.open(img_path) as im:
         img = np.asarray(im.convert("L")).astype(np.uint8)
 
-    # ROI maske yükle
     with Image.open(mask_path) as im:
         mask = np.asarray(im.convert("L")).astype(np.uint8)
 
-    # Maske boyutunu görüntüye eşitle
     if mask.shape != img.shape:
-        mask = cv2.resize(mask, (img.shape[1], img.shape[0]),
-                          interpolation=cv2.INTER_NEAREST)
+        mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
 
-    # 1. Otsu background removal
-    breast_mask = get_breast_mask(img)
-
-    # 2. CLAHE (sadece meme bölgesine)
-    clahe_img = apply_clahe(img, breast_mask)
-
-    # 3. Maske: breast bölgesi dışını temizle + binarize
-    mask_cleaned = np.where(breast_mask > 0, mask, 0).astype(np.uint8)
-    mask_cleaned = ((mask_cleaned > 127).astype(np.uint8)) * 255
-
-    # 4. Square pad + resize
-    img_sq = pad_to_square(clahe_img, pad_value=0)
-    mask_sq = pad_to_square(mask_cleaned, pad_value=0)
+    img_sq = pad_to_square(img, pad_value=0)
+    mask_sq = pad_to_square(mask, pad_value=0)
 
     img_r = cv2.resize(img_sq, (size, size), interpolation=cv2.INTER_AREA)
     mask_r = cv2.resize(mask_sq, (size, size), interpolation=cv2.INTER_NEAREST)
@@ -133,35 +73,26 @@ def main():
     print(f"[in] {in_path.name} shape: {df.shape}")
 
     out_rows = []
-    fg_ratios = []
     dropped = 0
 
     for i, row in tqdm(list(df.iterrows()), total=len(df)):
-        img_path = fix_path(row["full_image_abs_path"])
+        img_path = fix_path(row["cropped_image_abs_path"])
         mask_path = fix_path(row["combined_mask_abs_path"])
+        abnormality = row.get("abnormality_id", "")
 
         try:
             img_r, mask_r = process_single(img_path, mask_path, IMAGE_SIZE)
         except Exception as e:
             print(f"[warn] {row['patient_id']} "
-                  f"{row['left_or_right_breast']}_{row['image_view']}: "
+                  f"{row['left_or_right_breast']}_{row['image_view']}_{abnormality}: "
                   f"{type(e).__name__}: {e}")
             dropped += 1
             continue
 
-        # Foreground kontrolü
-        fg = int((mask_r > 127).sum())
-        if fg < 10:
-            dropped += 1
-            continue
-
-        fg_ratio = fg / (IMAGE_SIZE * IMAGE_SIZE)
-        fg_ratios.append(fg_ratio)
-
-        # Kaydet
-        name = f"{row['patient_id']}_{row['left_or_right_breast']}_{row['image_view']}"
+        name = f"{row['patient_id']}_{row['left_or_right_breast']}_{row['image_view']}_{abnormality}"
         img_out = IMG_OUT_DIR / f"{name}.png"
         mask_out = MASK_OUT_DIR / f"{name}.png"
+        
         Image.fromarray(img_r).save(img_out)
         Image.fromarray(mask_r).save(mask_out)
 
@@ -169,42 +100,28 @@ def main():
             "patient_id": row["patient_id"],
             "left_or_right_breast": row["left_or_right_breast"],
             "image_view": row["image_view"],
+            "abnormality_id": abnormality,
             "pathology": row["pathology"],
             "label": row["label"],
-            "pathology_original_combined": row["pathology_original_combined"],
-            "abnormality_ids": row["abnormality_ids"],
-            "n_abnormalities": row["n_abnormalities"],
+            "pathology_original": row.get("pathology_original", ""),
             "breast_density": row.get("breast_density", ""),
             "assessment": row.get("assessment", ""),
             "subtlety": row.get("subtlety", ""),
-            "collection": row.get("collection", ""),
             "source_split": row.get("source_split", ""),
             "processed_image_path": str(img_out),
             "processed_mask_path": str(mask_out),
-            "mask_fg_pixels": fg,
-            "mask_fg_ratio": fg_ratio,
-            "breast_area_ratio": row.get("breast_area_ratio", ""),
-            "mask_align_ratio": row.get("mask_align_ratio", ""),
-            "preprocessing": "otsu_bg_removal+clahe",
+            "mask_area_ratio": row.get("mask_area_ratio", ""),
+            "preprocessing": "square_pad+resize",
         })
 
     out_df = pd.DataFrame(out_rows)
 
-    # Rapor
     print(f"\n{'='*60}")
-    print(f"STEP 8 RAPOR: Otsu + CLAHE + Resize")
+    print(f"STEP 8 RAPOR: Pad + Resize")
     print(f"{'='*60}")
     print(f"  Giris       : {len(df)}")
     print(f"  Islenen     : {len(out_df)}")
     print(f"  Atilan      : {dropped}")
-
-    if fg_ratios:
-        fr = np.asarray(fg_ratios)
-        print(f"\n  Maske foreground orani (256x256):")
-        print(f"    mean   : {fr.mean():.4f}")
-        print(f"    median : {np.median(fr):.4f}")
-        print(f"    min    : {fr.min():.4f}")
-        print(f"    max    : {fr.max():.4f}")
 
     print(f"\n  Sinif dagilimi:")
     print(out_df["pathology"].value_counts().to_string())

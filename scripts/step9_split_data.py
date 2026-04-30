@@ -82,14 +82,15 @@ def main():
     ct_norm = pd.crosstab(df["split"], df["pathology"], normalize="index")
     print(ct_norm.round(3))
 
-    # FG ratio istatistikleri (split bazlı)
-    if "mask_fg_ratio" in df.columns:
-        print("\n[mask foreground ratio by split]")
+    # Area ratio istatistikleri (split bazlı)
+    if "mask_area_ratio" in df.columns:
+        print("\n[mask area ratio by split]")
         for s in ["train", "val", "test"]:
             sub = df[df["split"] == s]
-            fr = sub["mask_fg_ratio"]
-            print(f"  {s:5s}: mean={fr.mean():.4f}, median={fr.median():.4f}, "
-                  f"min={fr.min():.4f}, max={fr.max():.4f}")
+            fr = sub["mask_area_ratio"].dropna()
+            if len(fr) > 0:
+                print(f"  {s:5s}: mean={fr.mean():.4f}, median={fr.median():.4f}, "
+                      f"min={fr.min():.4f}, max={fr.max():.4f}")
 
     # Kaydet
     out = OUTPUT_DIR / "step9_splits.csv"
