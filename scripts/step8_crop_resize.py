@@ -42,17 +42,61 @@ def pad_to_square(arr: np.ndarray, pad_value: int = 0) -> np.ndarray:
     return cv2.copyMakeBorder(arr, pad_top, pad_bot, pad_left, pad_right,
                               cv2.BORDER_CONSTANT, value=pad_value)
 
+def extract_mask_crop(mask_full: np.ndarray, crop_h: int, crop_w: int) -> np.ndarray:
+    """Extract the crop-aligned region from a full-mammogram-resolution mask.
+
+    CBIS-DDSM ships the ROI mask at full mammogram resolution (~3000-5500px),
+    but the cropped image is a tight patch (~200-500px) around the lesion bbox.
+    Naively resizing both to 256x256 makes the mask appear as a tiny dot while
+    the lesion fills the crop. Fix: locate the lesion bbox in the full mask,
+    center a crop_h×crop_w window on it (matching the crop image extent), then
+    extract that region with zero-padding for any out-of-bounds area.
+    """
+    binar = mask_full > 127
+    if not binar.any():
+        return np.zeros((crop_h, crop_w), dtype=np.uint8)
+
+    rows_fg = np.any(binar, axis=1)
+    cols_fg = np.any(binar, axis=0)
+    rmin, rmax = np.where(rows_fg)[0][[0, -1]]
+    cmin, cmax = np.where(cols_fg)[0][[0, -1]]
+
+    # Center of lesion bbox in the full-resolution mask
+    cy = (int(rmin) + int(rmax)) // 2
+    cx = (int(cmin) + int(cmax)) // 2
+
+    # Window with same spatial extent as the crop image
+    y1 = cy - crop_h // 2
+    y2 = y1 + crop_h
+    x1 = cx - crop_w // 2
+    x2 = x1 + crop_w
+
+    # Zero-padded canvas; copy the in-bounds portion
+    out = np.zeros((crop_h, crop_w), dtype=np.uint8)
+    src_y1 = max(0, y1);  src_y2 = min(mask_full.shape[0], y2)
+    src_x1 = max(0, x1);  src_x2 = min(mask_full.shape[1], x2)
+    dst_y1 = src_y1 - y1; dst_x1 = src_x1 - x1
+    out[dst_y1: dst_y1 + (src_y2 - src_y1),
+        dst_x1: dst_x1 + (src_x2 - src_x1)] = mask_full[src_y1:src_y2, src_x1:src_x2]
+    return out
+
 
 def process_single(img_path: str, mask_path: str, size: int = IMAGE_SIZE) -> tuple:
-    """Tek bir görüntü-maske çifti: pad + resize."""
+    """Crop image + spatially-aligned mask crop → square pad + resize."""
     with Image.open(img_path) as im:
         img = np.asarray(im.convert("L")).astype(np.uint8)
 
     with Image.open(mask_path) as im:
-        mask = np.asarray(im.convert("L")).astype(np.uint8)
+        mask_full = np.asarray(im.convert("L")).astype(np.uint8)
 
-    if mask.shape != img.shape:
-        mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+    crop_h, crop_w = img.shape
+
+    # If mask is already at crop resolution (same dims), use directly;
+    # otherwise extract the matching region from the full-mammogram mask.
+    if mask_full.shape == img.shape:
+        mask = mask_full
+    else:
+        mask = extract_mask_crop(mask_full, crop_h, crop_w)
 
     img_sq = pad_to_square(img, pad_value=0)
     mask_sq = pad_to_square(mask, pad_value=0)
